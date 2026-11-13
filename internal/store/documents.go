@@ -117,3 +117,31 @@ func (s *Store) Stats(ctx context.Context) (docs int, chunks int, err error) {
 		`SELECT (SELECT COUNT(*) FROM documents), (SELECT COUNT(*) FROM chunks)`).Scan(&docs, &chunks)
 	return
 }
+
+// AddChunk записывает чанк с вектором и добавляет его в FTS-индекс.
+// Транзакция обязательна: чанк в chunks и строка в chunks_fts должны
+// появиться атомарно — иначе поиск на мгновение увидит рассинхрон.
+func (s *Store) AddChunk(ctx context.Context, docID, seq int64, text string, vec []float32) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO chunks (doc_id, seq, text, embedding) VALUES (?, ?, ?, ?)`,
+		docID, seq, text, encodeVec(vec))
+	if err != nil {
+		return err
+	}
+	chunkID, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	// rowid у FTS-таблицы сам сгенерируется; chunk_id (UNINDEXED) — мост.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO chunks_fts (text, chunk_id) VALUES (?, ?)`, text, chunkID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}

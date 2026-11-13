@@ -13,12 +13,19 @@ import (
 )
 
 type Ollama struct {
-	base string       // например http://localhost:11434
-	hc   *http.Client // долгий таймаут: генерация 7B-модели может занять минуты
+	base       string       // например http://localhost:11434
+	embedModel string       // модель для векторов (nomic-embed-text:latest)
+	chatModel  string       // модель для ответов (qwen2.5-coder:7b)
+	hc         *http.Client // долгий таймаут: генерация 7B-модели может занять минуты
 }
 
-func NewOllama(base string, timeout time.Duration) *Ollama {
-	return &Ollama{base: strings.TrimRight(base, "/"), hc: &http.Client{Timeout: timeout}}
+func NewOllama(base, embedModel, chatModel string, timeout time.Duration) *Ollama {
+	return &Ollama{
+		base:       strings.TrimRight(base, "/"),
+		embedModel: embedModel,
+		chatModel:  chatModel,
+		hc:         &http.Client{Timeout: timeout},
+	}
 }
 
 // --- Эмбеддинги ---
@@ -35,7 +42,7 @@ type embedResponse struct {
 }
 
 func (o *Ollama) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	body, err := json.Marshal(embedRequest{Model: "nomic-embed-text", Input: texts})
+	body, err := json.Marshal(embedRequest{Model: o.embedModel, Input: texts})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embed request: %w", err)
 	}
@@ -91,7 +98,7 @@ type chatChunk struct {
 }
 
 func (o *Ollama) ChatStream(ctx context.Context, messages []Message) (<-chan string, error) {
-	body, err := json.Marshal(chatRequest{Model: "qwen2.5-coder:7b", Messages: messages, Stream: true})
+	body, err := json.Marshal(chatRequest{Model: o.chatModel, Messages: messages, Stream: true})
 	if err != nil {
 		return nil, err
 	}
