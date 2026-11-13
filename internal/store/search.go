@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -17,22 +18,33 @@ type Hit struct {
 	Score   float64
 }
 
-// KeywordSearch — полнотекстовый поиск через FTS5.
-// MATCH принимает query-синтаксис FTS: слова, префиксы, фразы в кавычках.
-// bm25() — стандартная метрика релевантности полнотекстовых движков:
-// чем реже слово встречается в коллекции и чем чаще в конкретном чанке,
-// тем выше оценка. ORDER BY bm25(chunks_fts) — ASC, потому что
-// меньшее значение = лучше совпадение.
-func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, error) {
-	words := strings.Fields(query)
-	if len(words) == 0 {
-		return nil, nil
-	}
+// phraseRe — извлекает фразы в кавычках: пользователь имеет право
+// искать точное сочетание слов, а не россыпь терминов.
+var phraseRe = regexp.MustCompile(`"([^"]+)"`)
 
-	terms := make([]string, 0, len(words))
-	for _, w := range words {
-		// Оставляем только буквы и цифры: пунктуация и кавычки
-		// ломают FTS-синтаксис, чистый trimmed-токен безопасен и без кавычек.
+func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, error) {
+	// 1) фразы в кавычках — как фразы (порядок слов важен);
+	// 2) оставшиеся слова — независимыми термами через OR.
+	//
+	// Почему OR, а не AND: вопрос пользователя — естественная фраза,
+	// а не поисковый запрос. AND требует, чтобы ВСЕ слова («как»,
+	// «зовут», «героиню») встретились в одном чанке — такое совпадение
+	// почти невозможно, канал молча выдавал пустоту. OR даёт полноту:
+	// чанки с редкими словами bm25 поднимет в топ сам, частые («на»)
+	// почти не влияют на оценку.
+	phrases := phraseRe.FindAllString(query, -1)
+	rest := phraseRe.ReplaceAllString(query, " ")
+
+	var terms []string
+	for _, p := range phrases {
+		p = strings.Join(strings.Fields(p), " ")
+		if p == "" {
+			continue
+		}
+		p = strings.ReplaceAll(p, `"`, `""`)
+		terms = append(terms, `"`+p+`"`)
+	}
+	for _, w := range strings.Fields(rest) {
 		w = strings.ToLower(strings.TrimFunc(w, func(r rune) bool {
 			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 		}))
@@ -41,23 +53,26 @@ func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, 
 			continue
 		}
 		if len(r) > 4 {
-			// Псевдо-стемминг: unicode61 не умеет русскую морфологию,
-			// «машина» и «машине» для него разные слова. Префиксный
-			// оператор * покрывает падежные формы ценой лёгкого шума.
+			// Псевдо-стемминг: unicode61 не знает русской морфологии,
+			// «машине» и «машин» для него разные слова. Префикс *
+			// покрывает формы ценой лёгкого шума.
 			terms = append(terms, string(r[:len(r)-1])+"*")
 		} else {
-			terms = append(terms, `"`+strings.ReplaceAll(w, `"`, `""`)+`"`)
+			terms = append(terms, `"`+w+`"`)
 		}
 	}
 	if len(terms) == 0 {
 		return nil, nil
 	}
-	match := strings.Join(terms, " ")
+	match := strings.Join(terms, " OR ")
 
+	// ВАЖНО: contentless-таблица НЕ хранит UNINDEXED-колонки — f.chunk_id
+	// всегда NULL, и JOIN по нему давал ноль строк. Зато хранится rowid:
+	// пишем в FTS с rowid = chunks.id и джойнимся по f.rowid.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT c.id, c.doc_id, d.name, c.seq, c.text, bm25(chunks_fts) AS score
 		FROM chunks_fts f
-		JOIN chunks c ON c.id = f.chunk_id
+		JOIN chunks c ON c.id = f.rowid
 		JOIN documents d ON d.id = c.doc_id
 		WHERE chunks_fts MATCH ?
 		ORDER BY score ASC

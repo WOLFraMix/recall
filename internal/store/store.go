@@ -7,8 +7,10 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -17,6 +19,10 @@ import (
 
 	_ "modernc.org/sqlite" // драйвер-подключение: чистый Go, без CGO
 )
+
+// ErrNotFound — «такой записи нет». API переводит его в честный 404,
+// а не в невнятный 500: caller различает «сломалось» и «не существует».
+var ErrNotFound = errors.New("not found")
 
 // Store — обёртка над *sql.DB. Все запросы к базе живут здесь;
 // остальной код видит только методы с бизнес-смыслом.
@@ -94,20 +100,25 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id, seq);
 
 -- FTS5 — встроенный в SQLite полнотекстовый поиск.
--- UNINDEXED column: chunk_id хранится, но не участвует в поиске —
--- это мост от найденной строки к полному чанку.
 -- content='' — «contentless» таблица: FTS хранит только индекс,
 -- без дублирования текста (экономим память).
 -- contentless_delete=1 — ОБЯЗАТЕЛЬНА: без неё contentless-таблица
--- не поддерживает DELETE вовсе (SQLite отвечает ошибкой), а нам
--- удалять строки FTS при удалении документа — см. DeleteDocument.
+-- не поддерживает DELETE вовсе (SQLite отвечает ошибкой).
+--
+-- ВАЖНЫЙ УРОК: contentless-таблица хранит ТОЛЬКО rowid и индексируемые
+-- колонки. UNINDEXED-колонка chunk_id НЕ хранится и при чтении всегда
+-- NULL — прежний JOIN chunks_fts.chunk_id = chunks.id молча возвращал
+-- ноль строк, и FTS-канал поиска был мёртв с первого дня. Решение:
+-- не хранить ссылку отдельной колонкой, а писать в FTS с rowid чанка —
+-- rowid в contentless-таблице есть всегда, и JOIN идёт по f.rowid.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-	text, chunk_id UNINDEXED, content='', contentless_delete=1
+	text, content='', contentless_delete=1
 );
 
--- Мета-таблица: размерность вектора (nomic-embed-text даёт 768).
--- Храним её явно: при смене модели индекс нужно перестраивать,
--- и проверка размерности спасёт нас от тихой порчи поиска.
+-- Мета-таблица: имя модели эмбеддингов и размерность вектора
+-- (bge-m3 даёт 1024, nomic-embed-text — 768). Храним их явно:
+-- при смене модели индекс нужно перестраивать, и проверка меты
+-- спасёт нас от тихой порчи поиска векторами чужой размерности.
 CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
@@ -122,7 +133,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // --- Кодировка векторов ---
 //
 // Вектор []float32 храним как байты little-endian: 4 байта на координату.
-// Для 768 измерений это ровно 3072 байта на чанк. Любая СУБД с BLOB
+// Для 1024 измерений это ровно 4096 байт на чанк. Любая СУБД с BLOB
 // становится «векторной базой» — вопрос только в формате и функции близости.
 
 func encodeVec(v []float32) []byte {
@@ -160,4 +171,168 @@ func cosine(a, b []float32) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// --- Документы ---
+
+// AddDocument регистрирует документ в статусе pending: обработка
+// (парсинг, эмбеддинги) пойдёт позже в фоне — это контракт пайплайна.
+func (s *Store) AddDocument(ctx context.Context, name string, size int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO documents (name, size, status, created_at)
+		VALUES (?, ?, 'pending', ?)`,
+		name, size, time.Now().Unix(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert document: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("last insert id: %w", err)
+	}
+	return id, nil
+}
+
+// SetStatus — единая точка смены статуса документа: дашборд в UI
+// читает его из ListDocuments, поэтому любой шаг пайплайна здесь виден.
+// errorText пишется только при ошибке; при успешном шаге передаём "".
+func (s *Store) SetStatus(ctx context.Context, docID int64, status, errorText string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE documents SET status = ?, error = ? WHERE id = ?`,
+		status, errorText, docID,
+	)
+	return err
+}
+
+// ListDocuments — весь список для сайдбара, с числом чанков каждого
+// документа (подзапросом: N+1 не нужен, SQLite сделает всё одним проходом).
+func (s *Store) ListDocuments(ctx context.Context) ([]Document, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT d.id, d.name, d.size, d.status, d.error,
+		       (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.id),
+		       d.created_at
+		FROM documents d
+		ORDER BY d.id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Document
+	for rows.Next() {
+		var d Document
+		var created int64
+		if err := rows.Scan(&d.ID, &d.Name, &d.Size, &d.Status, &d.Error, &d.Chunks, &created); err != nil {
+			return nil, err
+		}
+		d.CreatedAt = time.Unix(created, 0)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeleteDocument удаляет документ вместе с его чанками И строками
+// FTS-индекса. Порядок критичен:
+//  1. сначала собираем id чанков и чистим FTS по их rowid — после
+//     CASCADE строки chunks исчезнут, и связать FTS с чанками
+//     будет нечем: получим «осиротевший» поисковый индекс;
+//  2. затем удаляем документ — chunks уйдут каскадом.
+//
+// Всё в одной транзакции: либо оба шага, либо ни один.
+func (s *Store) DeleteDocument(ctx context.Context, docID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op после Commit
+
+	// Собираем id чанков документа — это будущие rowid в FTS.
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM chunks WHERE doc_id = ?`, docID)
+	if err != nil {
+		return err
+	}
+	var chunkIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		chunkIDs = append(chunkIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	// Чистим FTS-индекс по rowid. Отдельным запросом на каждый id:
+	// чанков у одного документа — сотни, а транзакция всё равно одна.
+	for _, id := range chunkIDs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_fts WHERE rowid = ?`, id); err != nil {
+			return fmt.Errorf("delete fts row: %w", err)
+		}
+	}
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM documents WHERE id = ?`, docID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound // документ не существовал — честный 404 наверху
+	}
+	return tx.Commit()
+}
+
+// --- Чанки и векторы ---
+
+// AddChunk сохраняет чанк и его вектор + регистрирует чанк в FTS-индексе.
+// Всё в одной транзакции: чанк без индекса — это «невидимый» для
+// полнотекстового поиска кусок текста, тихая порча данных.
+//
+// Ключевая деталь FTS-вставки: (rowid, text) — rowid равен id чанка.
+// Именно по нему KeywordSearch джойнится обратно к полному чанку:
+// contentless-таблица НЕ хранит unindexed-колонок, зато rowid есть всегда.
+func (s *Store) AddChunk(ctx context.Context, docID, seq int64, text string, vec []float32) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO chunks (doc_id, seq, text, embedding)
+		VALUES (?, ?, ?, ?)`,
+		docID, seq, text, encodeVec(vec),
+	)
+	if err != nil {
+		return fmt.Errorf("insert chunk: %w", err)
+	}
+	chunkID, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("chunk last insert id: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)`,
+		chunkID, text,
+	); err != nil {
+		return fmt.Errorf("insert fts row: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// --- Статистика ---
+
+// Stats — пара чисел для шапки интерфейса: документов и чанков.
+func (s *Store) Stats(ctx context.Context) (docs, chunks int, err error) {
+	err = s.db.QueryRowContext(ctx, `
+		SELECT (SELECT COUNT(*) FROM documents),
+		       (SELECT COUNT(*) FROM chunks)`).Scan(&docs, &chunks)
+	return
 }
