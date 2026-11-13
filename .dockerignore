@@ -1,0 +1,5 @@
+data/
+.git/
+*.md
+struct.png
+instruction.txt
