@@ -318,3 +318,10 @@ button:hover {
     color: #c7cdd8;
     font-size: 14px;
 }
+
+.hit mark {
+    background: #2a4a7f;
+    color: #dbeafe;
+    border-radius: 3px;
+    padding: 0 2px;
+}

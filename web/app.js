@@ -246,13 +246,53 @@ async function doSearch() {
             head.append(doc, meta, bar);
 
             const text = document.createElement("p");
-            text.textContent = h.text;
+            highlightTerms(text, h.text, q);
             card.append(head, text);
             box.appendChild(card);
         }
     } catch (e) {
         box.textContent = "⚠️ " + e.message;
     }
+}
+
+// highlightTerms — подсветка совпадений запроса в тексте фрагмента.
+// Те же основы, что строит FTS-канал (псевдо-стемминг): слово длиннее
+// 4 букв теряет последнюю букву, короткие ищутся целиком. Так подсветка
+// согласована с поиском: подсвечивается ровно то, по чему фрагмент
+// нашёлся — включая шум вроде «машинально» по запросу «машина».
+// Текст собирается через DOM-узлы, а не innerHTML — пользовательский
+// текст не может стать исполняемым HTML (XSS-безопасность).
+function highlightTerms(el, text, query) {
+    const stems = [...new Set(
+        query.toLowerCase()
+            .split(/\s+/)
+            .map((w) => w.replace(/[^\p{L}\p{N}]/gu, ""))
+            .filter((w) => w.length > 0)
+            .map((w) => (w.length > 4 ? w.slice(0, -1) : w))
+    )];
+    if (!stems.length) {
+        el.textContent = text;
+        return;
+    }
+    // Более длинные основы в приоритете: «дариэн» не должна перехватываться
+    // более коротким совпадением. Спецсимволы экранируем — основа может
+    // содержать всё что угодно после чистки пунктуации не всегда чиста.
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+        "(" + stems.sort((a, b) => b.length - a.length).map(esc).join("|") + ")",
+        "giu"
+    );
+
+    let last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+        if (m[0].length === 0) { re.lastIndex++; continue; } // страховка от зацикливания
+        el.append(text.slice(last, m.index));
+        const mark = document.createElement("mark");
+        mark.textContent = m[0];
+        el.append(mark);
+        last = m.index + m[0].length;
+    }
+    el.append(text.slice(last));
 }
 
 $("#sbtn").addEventListener("click", doSearch);
