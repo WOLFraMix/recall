@@ -1,5 +1,6 @@
 # --- сборка Go ---
 /main
+/recall
 *.exe
 *.test
 *.out
@@ -19,6 +20,9 @@ build/
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
 
 # --- логи ---
 *.log
@@ -39,6 +43,7 @@ Modelfile.translate
 !.env.example
 
 # --- локальные данные (volume из docker-compose) ---
+/data/
 postgres_data/
 
 # --- прочие локальные файлы ---
