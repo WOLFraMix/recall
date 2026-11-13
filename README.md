@@ -1,6 +1,7 @@
 # Recall
 
 [![CI](https://github.com/WOLFraMix/recall/actions/workflows/ci.yml/badge.svg)](https://github.com/WOLFraMix/recall/actions)
+![Recall dashboard](docs/screenshot.png)
 
 ## Описание
 
@@ -52,10 +53,32 @@ Recall — классический RAG (Retrieval-Augmented Generation) на л
 - **Ollama** — локальный рантайм моделей
 - **Docker** — многоступенчатая сборка, non-root, healthcheck
 
-## Быстрый старт
+## Установка
 
-Требуется установленный [Ollama](https://ollama.com):
+> Нужен [Ollama](https://ollama.com) с двумя моделями:
+> `ollama pull nomic-embed-text && ollama pull qwen2.5-coder:7b`
+(первая для обработки текста, вторую можете использовать подходящую под ваше железо)
 
-```bash - пример
-ollama pull nomic-embed-text
-ollama pull qwen2.5-coder:7b
+### Вариант 1 — готовый бинарник
+
+Скачайте архив для своей платформы со страницы
+[Releases](https://github.com/WOLFraMix/recall/releases/latest),
+распакуйте и запустите:
+
+    ./recall            # Linux/macOS
+    .\recall.exe        # Windows
+
+### Вариант 2 — Docker
+
+    docker pull ghcr.io/wolframix/recall:latest
+    docker run -d -p 8080:8080 \
+      -e RC_LLM_URL=http://host.docker.internal:11434 \
+      -v ${PWD}/data:/app/data \
+      --add-host host.docker.internal:host-gateway \
+      ghcr.io/wolframix/recall
+
+### Вариант 3 — из исходников
+
+    git clone https://github.com/WOLFraMix/recall
+    cd recall
+    go build ./cmd/recall
