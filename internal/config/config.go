@@ -51,7 +51,7 @@ func Load() Config {
 		DBPath:        getEnv("RC_DB_PATH", "./data/recall.db"),
 		LLMURL:        getEnv("RC_LLM_URL", "http://localhost:11434"),
 		EmbedModel:    getEnv("RC_EMBED_MODEL", "nomic-embed-text"),
-		ChatModel:     getEnv("RC_CHAT_MODEL", "qwen2.5:7b"),
+		ChatModel:     getEnv("RC_CHAT_MODEL", "qwen2.5-coder:7b"),
 		ChunkSize:     getInt("RC_CHUNK_SIZE", 800),
 		ChunkOverlap:  getInt("RC_CHUNK_OVERLAP", 100),
 		TopK:          getInt("RC_TOP_K", 5),
