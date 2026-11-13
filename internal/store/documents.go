@@ -60,8 +60,12 @@ func (s *Store) ListDocuments(ctx context.Context) ([]Document, error) {
 	return out, rows.Err()
 }
 
-// DeleteDocument — каскадная уборка. Чанки удаляет ON DELETE CASCADE,
-// а вот FTS contentless-таблица живёт отдельно — вычищаем её сами.
+// DeleteDocument — полная уборка следа документа в одной транзакции.
+// Порядок важен: сначала собираем id чанков (они же rowid в FTS),
+// затем чистим FTS-индекс, сами чанки и в конце — запись документа.
+// Явное удаление чанков вместо надежды на ON DELETE CASCADE: каскад
+// зависит от прагмы foreign_keys конкретного соединения пула, а эта
+// операция обязана быть самодостаточной.
 // Всё в одной транзакции: либо удаляется всё, либо ничего.
 func (s *Store) DeleteDocument(ctx context.Context, id int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -70,7 +74,7 @@ func (s *Store) DeleteDocument(ctx context.Context, id int64) error {
 	}
 	defer func() { _ = tx.Rollback() }() // no-op после Commit
 
-	// Сначала собираем id чанков — они же rowid'ы в FTS.
+	// Собираем id чанков — по ним чистим FTS.
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM chunks WHERE doc_id = ?`, id)
 	if err != nil {
 		return err
@@ -86,11 +90,19 @@ func (s *Store) DeleteDocument(ctx context.Context, id int64) error {
 	}
 	rows.Close()
 
+	// Contentless FTS5 допускает DELETE только с опцией contentless_delete=1
+	// в схеме таблицы (см. migrate) — иначе SQLite отвечает ошибкой.
 	for _, cid := range chunkIDs {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_fts WHERE rowid = ?`, cid); err != nil {
 			return err
 		}
 	}
+
+	// Явно удаляем чанки с векторами.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE doc_id = ?`, id); err != nil {
+		return err
+	}
+
 	res, err := tx.ExecContext(ctx, `DELETE FROM documents WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -138,9 +150,12 @@ func (s *Store) AddChunk(ctx context.Context, docID, seq int64, text string, vec
 	if err != nil {
 		return err
 	}
-	// rowid у FTS-таблицы сам сгенерируется; chunk_id (UNINDEXED) — мост.
+	// rowid задаём ЯВНО равным chunkID: иначе FTS сгенерирует свои rowid
+	// (1, 2, 3...), и удаление по rowid = chunkID из DeleteDocument
+	// вычищало бы чужие строки. Явный rowid — это «мост» между таблицами.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO chunks_fts (text, chunk_id) VALUES (?, ?)`, text, chunkID); err != nil {
+		`INSERT INTO chunks_fts (rowid, text, chunk_id) VALUES (?, ?, ?)`,
+		chunkID, text, chunkID); err != nil {
 		return err
 	}
 	return tx.Commit()

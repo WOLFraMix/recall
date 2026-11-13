@@ -40,31 +40,27 @@ type Document struct {
 
 // New открывает базу и создаёт схему, если её ещё нет.
 func New(path string) (*Store, error) {
-	// Каталог создаём заранее: sqlite не умеет mkdir.
 	if dir := filepath.Dir(path); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create db dir: %w", err)
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	// Прагмы в DSN — ключевая деталь: они применяются К КАЖДОМУ соединению
+	// пула, а не только к первому (db.Exec применил бы прагму лишь к одному
+	// соединению из пула — на остальных настройки не действовали бы).
+	//   journal_mode=WAL — читатели не блокируют писателя;
+	//   busy_timeout=5000 — вторая горутина подождёт до 5с вместо SQLITE_BUSY;
+	//   foreign_keys=1 — целостность связей документов и чанков.
+	// Формат modernc-драйвера: ?_pragma=имя(значение)&_pragma=...
+	dsn := "file:" + path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(1)"
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
-	}
-
-	// Прагмы. Это настройки SQLite, а не таблицы — применяются на соединении:
-	// journal_mode=WAL — читатели не блокируют писателя (у нас api и ingest
-	// работают одновременно), busy_timeout — вторая горутина подождёт до 5с,
-	// а не упадёт с SQLITE_BUSY, foreign_keys — каскадное удаление чанков.
-	for _, pragma := range []string{
-		`PRAGMA journal_mode = WAL`,
-		`PRAGMA busy_timeout = 5000`,
-		`PRAGMA foreign_keys = ON`,
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
-		}
 	}
 
 	s := &Store{db: db}
@@ -101,9 +97,12 @@ CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id, seq);
 -- UNINDEXED column: chunk_id хранится, но не участвует в поиске —
 -- это мост от найденной строки к полному чанку.
 -- content='' — «contentless» таблица: FTS хранит только индекс,
--- без дублирования текста (экономим память, зато удалять надо руками — см. DeleteDocument).
+-- без дублирования текста (экономим память).
+-- contentless_delete=1 — ОБЯЗАТЕЛЬНА: без неё contentless-таблица
+-- не поддерживает DELETE вовсе (SQLite отвечает ошибкой), а нам
+-- удалять строки FTS при удалении документа — см. DeleteDocument.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-	text, chunk_id UNINDEXED, content=''
+	text, chunk_id UNINDEXED, content='', contentless_delete=1
 );
 
 -- Мета-таблица: размерность вектора (nomic-embed-text даёт 768).
