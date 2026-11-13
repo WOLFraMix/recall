@@ -223,9 +223,8 @@ func (a *API) chat(c *gin.Context) {
 	// 4. Стриминг токенов: канал из провайдера → SSE-события.
 	tokens, err := a.llm.ChatStream(ctx, buildPrompt(req.Question, hits))
 	if err != nil {
-		// Ошибка после начала SSE: заголовки уже ушли, 502 послать нельзя.
-		// Посылаем ошибку событием — фронтенд покажет её в чате.
 		a.sse(c, "error", gin.H{"error": err.Error()})
+		a.sse(c, "done", gin.H{})
 		return
 	}
 	for tok := range tokens {
