@@ -25,15 +25,17 @@ type Store struct {
 }
 
 // Document — запись о загруженном файле.
-// Status отражает этап пайплайна: pending → parsing → embedding → ready / error.
+// json-теги — это контракт API: фронтенд читает поля в нижнем регистре.
+// Без тегов Go отдал бы поля как есть ("Name", "Status") — и JS увидел бы
+// undefined. Явные теги = явный контракт, не зависящий от имён в Go.
 type Document struct {
-	ID        int64
-	Name      string
-	Size      int64
-	Status    string
-	Error     string
-	Chunks    int
-	CreatedAt time.Time
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	Size      int64     `json:"size"`
+	Status    string    `json:"status"`
+	Error     string    `json:"error"`
+	Chunks    int       `json:"chunks"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // New открывает базу и создаёт схему, если её ещё нет.
