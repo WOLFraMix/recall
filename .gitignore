@@ -45,10 +45,12 @@ Modelfile.translate
 # --- локальные данные (volume из docker-compose) ---
 /data/
 postgres_data/
+testdata/
 
 # --- прочие локальные файлы ---
 highscore.json
 settings.json
+bench.json
 
 # --- OS ---
 .DS_Store
