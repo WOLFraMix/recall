@@ -49,8 +49,6 @@ postgres_data/
 # --- прочие локальные файлы ---
 highscore.json
 settings.json
-*.html
-!index.html
 
 # --- OS ---
 .DS_Store
@@ -61,3 +59,7 @@ desktop.ini
 /instruction.txt
 /notes.txt
 /struct.png
+*.docx
+*.pdf
+*.doc
+*.text

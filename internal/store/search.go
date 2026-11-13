@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"strings"
+	"unicode"
 )
 
 // Hit — результат поиска: чанк + оценка релевантности + имя документа
@@ -23,18 +24,35 @@ type Hit struct {
 // тем выше оценка. ORDER BY bm25(chunks_fts) — ASC, потому что
 // меньшее значение = лучше совпадение.
 func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, error) {
-	// Экранируем пользовательский ввод: FTS-синтаксис чувствителен
-	// к кавычкам и спецсимволам, чистый ввод может сломать запрос
-	// или наоборот расширить его. Оборачиваем каждое слово в двойные
-	// кавычки — превращаем произвольный текст в безопасные фразы.
 	words := strings.Fields(query)
 	if len(words) == 0 {
 		return nil, nil
 	}
-	for i, w := range words {
-		words[i] = `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+
+	terms := make([]string, 0, len(words))
+	for _, w := range words {
+		// Оставляем только буквы и цифры: пунктуация и кавычки
+		// ломают FTS-синтаксис, чистый trimmed-токен безопасен и без кавычек.
+		w = strings.ToLower(strings.TrimFunc(w, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		}))
+		r := []rune(w)
+		if len(r) == 0 {
+			continue
+		}
+		if len(r) > 4 {
+			// Псевдо-стемминг: unicode61 не умеет русскую морфологию,
+			// «машина» и «машине» для него разные слова. Префиксный
+			// оператор * покрывает падежные формы ценой лёгкого шума.
+			terms = append(terms, string(r[:len(r)-1])+"*")
+		} else {
+			terms = append(terms, `"`+strings.ReplaceAll(w, `"`, `""`)+`"`)
+		}
 	}
-	match := strings.Join(words, " ")
+	if len(terms) == 0 {
+		return nil, nil
+	}
+	match := strings.Join(terms, " ")
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT c.id, c.doc_id, d.name, c.seq, c.text, bm25(chunks_fts) AS score

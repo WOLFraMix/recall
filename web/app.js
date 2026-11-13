@@ -214,30 +214,39 @@ async function doSearch() {
             box.textContent = "Ничего не найдено";
             return;
         }
+        // Нормализация полей: бэкенд мог отдать их в нижнем регистре
+        // (с json-тегами) или как есть из Go ("Doc", "Seq"...).
+        // Принимаем оба варианта — фронтенд не зависит от нейминга.
+        const norm = hits.map((h) => ({
+            doc: h.doc ?? h.Doc ?? "",
+            seq: h.seq ?? h.Seq ?? "",
+            text: h.text ?? h.Text ?? "",
+            score: Number(h.score ?? h.Score ?? 0),
+        }));
         // RRF-оценки — не проценты (это суммы ранговых весов ~1/(60+rank)),
         // поэтому шкала относительная: лучший хит = 100%.
-        const max = Math.max(...hits.map((h) => Number(h.score) || 0), 1e-9);
-        for (const h of hits) {
+        const max = Math.max(...norm.map((h) => h.score), 1e-9);
+        for (const h of norm) {
             const card = document.createElement("div");
             card.className = "hit";
 
             const head = document.createElement("div");
             head.className = "hit-head";
             const doc = document.createElement("b");
-            doc.textContent = h.doc ?? "";
+            doc.textContent = h.doc;
             const meta = document.createElement("span");
             meta.className = "hit-meta";
-            meta.textContent = `фрагм. ${h.seq}`;
+            meta.textContent = h.seq !== "" ? `фрагм. ${h.seq}` : "";
             const bar = document.createElement("div");
             bar.className = "bar";
             const fill = document.createElement("div");
             fill.className = "fill";
-            fill.style.width = Math.round(((Number(h.score) || 0) / max) * 100) + "%";
+            fill.style.width = Math.round((h.score / max) * 100) + "%";
             bar.appendChild(fill);
             head.append(doc, meta, bar);
 
             const text = document.createElement("p");
-            text.textContent = h.text ?? "";
+            text.textContent = h.text;
             card.append(head, text);
             box.appendChild(card);
         }

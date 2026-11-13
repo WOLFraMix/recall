@@ -219,17 +219,16 @@ func chunkText(text string, chunkSize, overlap int) []string {
 	return chunks
 }
 
-// extractText достаёт текст из файла. Учитывает три реальности:
-//  1. UTF-8 BOM (три байта EF BB BF) — Windows-редакторы его любят ставить,
-//     для Go-строки это мусор в начале первого чанка;
-//  2. UTF-16 LE/BE с BOM — кодировка по умолчанию для файлов, сохранённых
-//     через Windows PowerShell: два байта на символ, без конвертации
-//     валидатор UTF-8 честно откажет, хотя текст там нормальный;
-//  3. чистый UTF-8 — путь большинства.
+// extractText достаёт текст из файла. Учитывает четыре реальности:
+//  1. бинарные форматы — PDF и DOCX разбирают специализированные
+//     парсеры, и это надо делать ДО проверки UTF-8: для текстового
+//     валидатора PDF — валидный бинарный мусор, а не текст;
+//  2. UTF-16 LE/BE с BOM — кодировка по умолчанию для файлов,
+//     сохранённых через Windows PowerShell;
+//  3. UTF-8 BOM — три байта мусора в начале, откусываем;
+//  4. чистый UTF-8 — путь большинства.
 func extractText(body []byte, name string) (string, error) {
-	// Бинарные форматы разбираем специализированными парсерами
-	// ДО валидации UTF-8: PDF и DOCX — валидный бинарный мусор
-	// с точки зрения текстового валидатора.
+	// Сначала — бинарные форматы по расширению имени файла.
 	switch strings.ToLower(filepath.Ext(name)) {
 	case ".pdf":
 		return extractPDF(body)
@@ -239,7 +238,6 @@ func extractText(body []byte, name string) (string, error) {
 
 	// UTF-16 с BOM: FF FE — little-endian, FE FF — big-endian.
 	if len(body) >= 2 && ((body[0] == 0xFF && body[1] == 0xFE) || (body[0] == 0xFE && body[1] == 0xFF)) {
-		// UseBOM: декодер читает порядок байтов из самого BOM.
 		decoded, err := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder().Bytes(body)
 		if err != nil {
 			return "", fmt.Errorf("decode UTF-16: %w", err)
