@@ -45,6 +45,7 @@ postgres_data/
 highscore.json
 settings.json
 *.html
+!index.html
 
 # --- OS ---
 .DS_Store

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Recall — второй мозг</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header>
+        <h1>Recall</h1>
+        <div id="stats" class="stats">загрузка…</div>
+    </header>
+    <main>
+        <aside>
+            <div id="drop" class="drop">
+                Перетащите файлы сюда<br><small>или нажмите, чтобы выбрать</small>
+                <input type="file" id="file" multiple
+                    accept=".txt,.md,.html,.json,.go,.py,.js,.rs,.c,.cpp,.h,.java,.yaml,.yml,.csv,.log">
+            </div>
+            <h2>Документы</h2>
+            <ul id="docs"></ul>
+        </aside>
+        <section id="chatpane">
+            <div id="chat"></div>
+            <form id="ask">
+                <textarea id="q" rows="2" placeholder="Спросите что-нибудь по своим документам…"></textarea>
+                <button id="send" type="submit">Спросить</button>
+                <button id="stop" type="button" hidden>Стоп</button>
+            </form>
+        </section>
+    </main>
+    <script src="app.js"></script>
+</body>
+
+</html>
