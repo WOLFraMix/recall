@@ -12,13 +12,19 @@
     <header>
         <h1>Recall</h1>
         <div id="stats" class="stats">загрузка…</div>
+        <nav class="tabs">
+            <button class="tab active" data-tab="chat">Чат</button>
+            <button class="tab" data-tab="search">Поиск</button>
+        </nav>
     </header>
-    <main>
+
+    <!-- Вкладка «Чат»: сайдбар с документами + переписка -->
+    <main id="view-chat">
         <aside>
             <div id="drop" class="drop">
                 Перетащите файлы сюда<br><small>или нажмите, чтобы выбрать</small>
                 <input type="file" id="file" multiple
-                    accept=".txt,.md,.html,.json,.go,.py,.js,.rs,.c,.cpp,.h,.java,.yaml,.yml,.csv,.log">
+                    accept=".txt,.md,.html,.json,.go,.py,.js,.rs,.c,.cpp,.h,.java,.yaml,.yml,.csv,.log,.pdf,.docx">
             </div>
             <h2>Документы</h2>
             <ul id="docs"></ul>
@@ -32,6 +38,18 @@
             </form>
         </section>
     </main>
+
+    <!-- Вкладка «Поиск»: сырые результаты ретривера с полосками релевантности -->
+    <main id="view-search" hidden>
+        <section class="searchwrap">
+            <div class="searchbar">
+                <input id="sq" placeholder="Поиск по чанкам документов…">
+                <button id="sbtn">Найти</button>
+            </div>
+            <div id="results"></div>
+        </section>
+    </main>
+
     <script src="app.js"></script>
 </body>
 

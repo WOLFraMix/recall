@@ -1,4 +1,4 @@
-// Recall UI: загрузка документов, чат со стримингом (SSE из fetch).
+// Recall UI: загрузка документов, чат со стримингом (SSE из fetch), поиск.
 // Правила надёжности:
 //  1) состояние занятости — отдельный флаг busy, восстанавливается в finally;
 //  2) один битый кадр потока не убивает обработку остальных (try/catch в цикле);
@@ -23,6 +23,15 @@ function esc(s) {
     d.textContent = s == null ? "" : String(s);
     return d.innerHTML;
 }
+
+// --- Вкладки ---
+
+const tabs = document.querySelectorAll(".tab");
+tabs.forEach((t) => t.addEventListener("click", () => {
+    tabs.forEach((x) => x.classList.toggle("active", x === t));
+    document.getElementById("view-chat").hidden = t.dataset.tab !== "chat";
+    document.getElementById("view-search").hidden = t.dataset.tab !== "search";
+}));
 
 // --- Загрузка файлов ---
 
@@ -188,3 +197,54 @@ function addMsg(role, text) {
     chat.scrollTop = chat.scrollHeight;
     return div;
 }
+
+// --- Поиск ---
+
+async function doSearch() {
+    const q = $("#sq").value.trim();
+    if (!q) return;
+    const box = $("#results");
+    box.replaceChildren();
+
+    try {
+        const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+        if (!r.ok) throw new Error(`ошибка ${r.status}`);
+        const hits = await r.json();
+        if (!Array.isArray(hits) || !hits.length) {
+            box.textContent = "Ничего не найдено";
+            return;
+        }
+        // RRF-оценки — не проценты (это суммы ранговых весов ~1/(60+rank)),
+        // поэтому шкала относительная: лучший хит = 100%.
+        const max = Math.max(...hits.map((h) => Number(h.score) || 0), 1e-9);
+        for (const h of hits) {
+            const card = document.createElement("div");
+            card.className = "hit";
+
+            const head = document.createElement("div");
+            head.className = "hit-head";
+            const doc = document.createElement("b");
+            doc.textContent = h.doc ?? "";
+            const meta = document.createElement("span");
+            meta.className = "hit-meta";
+            meta.textContent = `фрагм. ${h.seq}`;
+            const bar = document.createElement("div");
+            bar.className = "bar";
+            const fill = document.createElement("div");
+            fill.className = "fill";
+            fill.style.width = Math.round(((Number(h.score) || 0) / max) * 100) + "%";
+            bar.appendChild(fill);
+            head.append(doc, meta, bar);
+
+            const text = document.createElement("p");
+            text.textContent = h.text ?? "";
+            card.append(head, text);
+            box.appendChild(card);
+        }
+    } catch (e) {
+        box.textContent = "⚠️ " + e.message;
+    }
+}
+
+$("#sbtn").addEventListener("click", doSearch);
+$("#sq").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });

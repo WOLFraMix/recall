@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -226,6 +227,16 @@ func chunkText(text string, chunkSize, overlap int) []string {
 //     валидатор UTF-8 честно откажет, хотя текст там нормальный;
 //  3. чистый UTF-8 — путь большинства.
 func extractText(body []byte, name string) (string, error) {
+	// Бинарные форматы разбираем специализированными парсерами
+	// ДО валидации UTF-8: PDF и DOCX — валидный бинарный мусор
+	// с точки зрения текстового валидатора.
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".pdf":
+		return extractPDF(body)
+	case ".docx":
+		return extractDOCX(body)
+	}
+
 	// UTF-16 с BOM: FF FE — little-endian, FE FF — big-endian.
 	if len(body) >= 2 && ((body[0] == 0xFF && body[1] == 0xFE) || (body[0] == 0xFE && body[1] == 0xFF)) {
 		// UseBOM: декодер читает порядок байтов из самого BOM.
