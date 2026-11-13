@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -96,11 +97,20 @@ func (a *API) upload(c *gin.Context) {
 		return
 	}
 
-	// Раннее отсечение бинарников: до постановки в очередь,
-	// с понятной ошибкой пользователю.
-	if !utf8.Valid(body) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "файл не является текстом (бинарный?)"})
-		return
+	// Раннее отсечение бинарников — но только для ТЕКСТОВЫХ форматов.
+	// PDF и DOCX — бинарные по своей природе: их UTF-8-валидность
+	// проверять бессмысленно (всегда «невалидны»), корректность
+	// определит специализированный парсер внутри пайплайна.
+	// Без этой оговорки проверка отсекала бы их за миллисекунды
+	// с бессмысленной ошибкой «не является текстом».
+	switch strings.ToLower(filepath.Ext(fh.Filename)) {
+	case ".pdf", ".docx":
+		// валидность проверит парсер
+	default:
+		if !utf8.Valid(body) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "файл не является текстом (бинарный?)"})
+			return
+		}
 	}
 
 	docID, err := a.st.AddDocument(c.Request.Context(), fh.Filename, int64(len(body)))
