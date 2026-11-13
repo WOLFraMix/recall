@@ -147,25 +147,31 @@ func (s *Store) HybridSearch(ctx context.Context, queryVec []float32, query stri
 		return nil, err
 	}
 
-	const rrfK = 60.0
-	scores := map[int64]float64{} // chunk_id → накопленный RRF-балл
-	bests := map[int64]Hit{}      // chunk_id → лучший Hit (с текстом)
+	// RRF с весами каналов. Голый RRF (все веса = 1) ставит чанк,
+	// попавший лишь на 5-е место FTS, выше чанка с 1-м местом FTS,
+	// если первый вдобавок есть в векторном списке: 1/61 + 1/62 > 1/61.
+	// Это убивало точные совпадения: README («на вашей машине») вылетал
+	// из топа, потому что «машинально» из книги матчится префиксом И
+	// семантически близко к «машине». Вес 2 за FTS — «попал в оба» уже
+	// не перекрывает «первое место в точном поиске».
+	const (
+		rrfK      = 60.0
+		weightFTS = 2.0
+		weightVec = 1.0
+	)
+	scores := map[int64]float64{}
+	bests := map[int64]Hit{}
 
-	// add — замыкание: одна логика начисления очков для обоих списков.
-	// rank считается с 1: первое место даёт 1/(60+1) — самый жирный вклад.
-	add := func(hits []Hit) {
+	add := func(hits []Hit, w float64) {
 		for i, h := range hits {
-			rank := i + 1
-			scores[h.ChunkID] += 1.0 / (rrfK + float64(rank))
-			// Из двух списков, где встретился чанк, храним экземпляр
-			// с более полным текстом — он пойдёт в цитату.
+			scores[h.ChunkID] += w / (rrfK + float64(i+1))
 			if prev, ok := bests[h.ChunkID]; !ok || len(h.Text) > len(prev.Text) {
 				bests[h.ChunkID] = h
 			}
 		}
 	}
-	add(kw)
-	add(vec)
+	add(kw, weightFTS)
+	add(vec, weightVec)
 
 	merged := make([]Hit, 0, len(bests))
 	for id, h := range bests {
