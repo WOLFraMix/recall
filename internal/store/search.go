@@ -2,22 +2,12 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"unicode"
 )
-
-// Hit — результат поиска: чанк + оценка релевантности + имя документа
-// (для отображения источника в интерфейсе).
-type Hit struct {
-	ChunkID int64
-	DocID   int64
-	DocName string
-	Seq     int
-	Text    string
-	Score   float64
-}
 
 // phraseRe — извлекает фразы в кавычках: пользователь имеет право
 // искать точное сочетание слов, а не россыпь терминов.
@@ -25,10 +15,7 @@ var phraseRe = regexp.MustCompile(`"([^"]+)"`)
 
 // russianStop — служебные слова русского языка. В FTS они не должны
 // становиться термами: bm25 понижает их вес в СВОЕЙ шкале, но RRF видит
-// только позиции — а частотные слова дают им позиции, забивая канал
-// шумом. Урок бенчмарка: «что делает это приложение?» через OR выдало
-// 16 чанков книги по слову «что», и они вытеснили README с векторного
-// ранга 1. Стоп-слова режут шум до того, как он попал в fusion.
+// только позиции — а частотные слова дают им позиции, забивая канал шумом.
 var russianStop = map[string]struct{}{
 	"а": {}, "без": {}, "больше": {}, "будет": {}, "будто": {}, "бы": {},
 	"был": {}, "была": {}, "были": {}, "было": {}, "быть": {}, "в": {},
@@ -59,34 +46,70 @@ func IsStopword(w string) bool {
 	return ok
 }
 
-// KeywordSearch — полнотекстовый канал гибридного поиска.
-// Два фильтра шума, каждый — урок из бенчмарка:
-//  1. стоп-слова: служебные слова не становятся термами;
-//  2. адаптивный DF-фильтр: основа, встречающаяся более чем в 5%
-//     чанков корпуса, не несёт различительного смысла (в романе это
-//     «делае*», в техдокументации — то же слово сильный термин!
-//     Поэтому фильтр считаем по КАЖДОМУ корпусу, а не фиксируем
-//     списком). Без него частотные основы заполняли выдачу и
-//     вытесняли сильные векторные совпадения из fusion.
-func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, error) {
+// Параметры DF-фильтра — уроки бенчмарка:
+//
+//	dfAbsPct — абсолютный потолок: терм в >5% чанков корпуса не
+//	           различает документы;
+//	dfRelFactor — относительный потолок: терм в >10 раз частотнее
+//	           самого редкого терма запроса — шум на фоне якоря.
+//	           Порог именно ОТНОСИТЕЛЬНЫЙ: фиксированные проценты либо
+//	           пропускают «делае*» (df~40 < 5% от 1115), либо режут
+//	           «машин*» в маленькой базе. Якорь запроса — честный
+//	           масштаб для каждого конкретного вопроса.
+//	dfMinKeep — нижняя граница порогов: запрос с одним сверхредким
+//	           словом не должен выкашивать всех соседей.
+const (
+	dfAbsPct    = 5
+	dfRelFactor = 10
+	dfMinKeep   = 5
+)
+
+// Hit — результат поиска: чанк, его документ и оценка канала.
+type Hit struct {
+	ChunkID int64
+	DocID   int64
+	DocName string
+	Seq     int
+	Text    string
+	Score   float64
+}
+
+// TermDF — строка «плана запроса»: терм, его частота в корпусе
+// и решение фильтра. Используется ftscheck: диагностика обязана
+// показывать те же решения, что принимает продакшен-канал.
+type TermDF struct {
+	Term   string
+	DF     int
+	Kept   bool
+	Reason string
+}
+
+// planAll — единая точка построения FTS-запроса: фразы, стоп-слова,
+// псевдо-стемминг, DF-фильтр. KeywordSearch и HybridSearch зовут её,
+// поэтому логика не может разъехаться между каналами.
+// Возвращает готовое MATCH-выражение, df самого редкого терм
+// (специфичность запроса — для адаптивного веса канала) и план.
+func (s *Store) planAll(ctx context.Context, query string) (string, int, []TermDF, error) {
 	phrases := phraseRe.FindAllString(query, -1)
 	rest := phraseRe.ReplaceAllString(query, " ")
 
-	// Кандидаты: фразы (явный выбор пользователя — не фильтруем)
-	// и одиночные слова (стоп-слова отсекаем, длинные — в префикс).
-	type cand struct {
-		term  string
-		isPhr bool
-	}
-	var cands []cand
+	var kept []string
+	var plan []TermDF
+
+	// Фразы — явный выбор пользователя: не фильтруем ни чем.
 	for _, p := range phrases {
 		p = strings.Join(strings.Fields(p), " ")
 		if p == "" {
 			continue
 		}
 		p = strings.ReplaceAll(p, `"`, `""`)
-		cands = append(cands, cand{`"` + p + `"`, true})
+		term := `"` + p + `"`
+		kept = append(kept, term)
+		plan = append(plan, TermDF{Term: term, Kept: true, Reason: "фраза — не фильтруем"})
 	}
+
+	// Одиночные слова: чистка → стоп-лист → псевдо-стемминг.
+	var words []string
 	for _, w := range strings.Fields(rest) {
 		w = strings.ToLower(strings.TrimFunc(w, func(r rune) bool {
 			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
@@ -95,6 +118,7 @@ func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, 
 			continue
 		}
 		if _, stop := russianStop[w]; stop {
+			plan = append(plan, TermDF{Term: w, Kept: false, Reason: "стоп-слово"})
 			continue
 		}
 		r := []rune(w)
@@ -102,66 +126,106 @@ func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, 
 			continue
 		}
 		if len(r) > 4 {
-			cands = append(cands, cand{string(r[:len(r)-1]) + "*", false})
+			// Псевдо-стемминг: unicode61 не знает русской морфологии,
+			// «машина» и «машине» для него разные слова. Префикс *
+			// покрывает формы ценой лёгкого шума.
+			words = append(words, string(r[:len(r)-1])+"*")
 		} else {
-			cands = append(cands, cand{`"` + strings.ReplaceAll(w, `"`, `""`) + `"`, false})
+			words = append(words, `"`+strings.ReplaceAll(w, `"`, `""`)+`"`)
 		}
 	}
-	if len(cands) == 0 {
-		return nil, nil
+	if len(words) == 0 {
+		if len(kept) == 0 {
+			return "", 0, plan, nil
+		}
+		return strings.Join(kept, " OR "), 0, plan, nil
 	}
 
-	// DF-фильтр: порог = max(5, 5% от числа чанков). Считать count на
-	// базу из тысячи чанков — микросекунды, кэшировать незачем.
 	var total int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&total); err != nil {
-		return nil, err
+		return "", 0, plan, err
 	}
-	dfLimit := total * 5 / 100
-	if dfLimit < 5 {
-		dfLimit = 5
+	absLimit := total * dfAbsPct / 100
+	if absLimit < dfMinKeep {
+		absLimit = dfMinKeep
 	}
 
-	var kept []string
-	type droppedTerm struct {
+	// df каждого терма — один COUNT по FTS-индексу, микросекунды.
+	type wdf struct {
 		term string
 		df   int
 	}
-	var dropped []droppedTerm
-	for _, c := range cands {
-		if c.isPhr {
-			kept = append(kept, c.term)
-			continue
-		}
+	var wdfs []wdf
+	for _, term := range words {
 		var df int
 		if err := s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?`, c.term,
+			`SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?`, term,
 		).Scan(&df); err != nil {
-			continue // битый терм не роняет канал — просто пропускаем
+			plan = append(plan, TermDF{Term: term, Kept: false, Reason: "ошибка подсчёта"})
+			continue
 		}
-		if df <= dfLimit {
-			kept = append(kept, c.term)
-		} else {
-			dropped = append(dropped, droppedTerm{c.term, df})
+		wdfs = append(wdfs, wdf{term, df})
+	}
+
+	// Специфичность запроса = df самого редкого встречающегося терма.
+	dfMin := -1
+	for _, d := range wdfs {
+		if d.df > 0 && (dfMin == -1 || d.df < dfMin) {
+			dfMin = d.df
+		}
+	}
+	relLimit := 0
+	if dfMin > 0 {
+		relLimit = dfRelFactor * dfMin
+	}
+
+	for _, d := range wdfs {
+		switch {
+		case d.df == 0:
+			plan = append(plan, TermDF{d.term, 0, false, "нет в корпусе"})
+		case d.df > absLimit:
+			plan = append(plan, TermDF{d.term, d.df, false,
+				fmt.Sprintf("частотный: %d > %d (5%% корпуса)", d.df, absLimit)})
+		case relLimit > 0 && d.df > relLimit:
+			plan = append(plan, TermDF{d.term, d.df, false,
+				fmt.Sprintf("шумный: %d > %d (%d× редчайшего)", d.df, relLimit, dfRelFactor)})
+		default:
+			kept = append(kept, d.term)
+			plan = append(plan, TermDF{d.term, d.df, true, ""})
 		}
 	}
 
-	// Все термы частотные (вопрос целиком из частотных слов) — берём
-	// два самых редких: пусть канал молчит осмысленно, а не нулём.
-	if len(kept) == 0 && len(dropped) > 0 {
-		sort.Slice(dropped, func(i, j int) bool { return dropped[i].df < dropped[j].df })
-		for i, d := range dropped {
+	// Всё отсечено — берём два самых редких: канал пусть молчит
+	// осмысленно, а не возвращает ноль.
+	if len(kept) == 0 && len(wdfs) > 0 {
+		sort.Slice(wdfs, func(i, j int) bool { return wdfs[i].df < wdfs[j].df })
+		for i, d := range wdfs {
 			if i == 2 {
 				break
+			}
+			if d.df == 0 {
+				continue
 			}
 			kept = append(kept, d.term)
 		}
 	}
 	if len(kept) == 0 {
-		return nil, nil
+		return "", 0, plan, nil
 	}
-	match := strings.Join(kept, " OR ")
+	if dfMin < 0 {
+		dfMin = 0
+	}
+	return strings.Join(kept, " OR "), dfMin, plan, nil
+}
 
+// PlanQuery — разбор запроса для диагностики (ftscheck).
+func (s *Store) PlanQuery(ctx context.Context, query string) ([]TermDF, int, error) {
+	_, dfMin, plan, err := s.planAll(ctx, query)
+	return plan, dfMin, err
+}
+
+// searchFTS — исполнение готового MATCH-выражения.
+func (s *Store) searchFTS(ctx context.Context, match string, k int) ([]Hit, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT c.id, c.doc_id, d.name, c.seq, c.text, bm25(chunks_fts) AS score
 		FROM chunks_fts f
@@ -186,11 +250,19 @@ func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, 
 	return out, rows.Err()
 }
 
-// VectorSearch — семантический поиск: перебираем все чанки, считаем
-// косинусную близость с вектором вопроса. O(N) по числу чанков —
-// для личного архива (десятки тысяч) это миллисекунды на любом CPU.
-// Именно так работали первые версии векторных БД; анн-индексы (HNSW
-// и подобные) нужны, когда N = миллионы — отличный пункт «Limitations».
+// KeywordSearch — полнотекстовый канал: план запроса + исполнение.
+func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, error) {
+	match, _, _, err := s.planAll(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if match == "" {
+		return nil, nil
+	}
+	return s.searchFTS(ctx, match, k)
+}
+
+// VectorSearch — семантический канал (без изменений).
 func (s *Store) VectorSearch(ctx context.Context, queryVec []float32, k int) ([]Hit, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT c.id, c.doc_id, d.name, c.seq, c.text, c.embedding
@@ -215,8 +287,6 @@ func (s *Store) VectorSearch(ctx context.Context, queryVec []float32, k int) ([]
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-
-	// Сортировка по убыванию близости, отрезаем топ-k.
 	sortByScoreDesc(all)
 	if len(all) > k {
 		all = all[:k]
@@ -224,47 +294,53 @@ func (s *Store) VectorSearch(ctx context.Context, queryVec []float32, k int) ([]
 	return all, nil
 }
 
-// HybridSearch — слияние двух поисков через Reciprocal Rank Fusion.
-// Не смотрим на «сырые» оценки (bm25 и косинус — несравнимые шкалы!),
-// а учитываем только ПОЗИЦИИ в каждом списке: score = Σ 1/(k + rank_i).
-// Константа k=60 сглаживает разницу между первым и десятым местом.
+// HybridSearch — слияние каналов через RRF с АДАПТИВНЫМ весом FTS.
+// Урок bench: статический вес 2 превращал частотные слова в топ fusion
+// («что делает...» — толпа чанков с «делае*» била README с векторного
+// ранга 1). Вес канала = функция специфичности запроса (df редчайшего
+// терма): редкий якорь → точный сигнал → вес 2; только частотные слова
+// → FTS-сигнал слабый → вес 0.5, топ вектора спасён.
 func (s *Store) HybridSearch(ctx context.Context, queryVec []float32, query string, k int) ([]Hit, error) {
-	// Берём k*2 из каждого поиска: fusion отрежет лишнее,
-	// а на вход её лучше кормить шире, чем итоговый топ.
-	kw, err := s.KeywordSearch(ctx, query, k*2)
+	match, dfMin, _, err := s.planAll(ctx, query)
 	if err != nil {
 		return nil, err
+	}
+
+	weightFTS := 2.0
+	switch {
+	case dfMin > 30:
+		weightFTS = 0.5
+	case dfMin > 10:
+		weightFTS = 1.0
+	}
+
+	var kw []Hit
+	if match != "" {
+		kw, err = s.searchFTS(ctx, match, k*2)
+		if err != nil {
+			return nil, err
+		}
 	}
 	vec, err := s.VectorSearch(ctx, queryVec, k*2)
 	if err != nil {
 		return nil, err
 	}
 
-	// RRF с весами каналов. Голый RRF (все веса = 1) ставит чанк,
-	// попавший лишь на 5-е место FTS, выше чанка с 1-м местом FTS,
-	// если первый вдобавок есть в векторном списке: 1/61 + 1/62 > 1/61.
-	// Это убивало точные совпадения: README («на вашей машине») вылетал
-	// из топа, потому что «машинально» из книги матчится префиксом И
-	// семантически близко к «машине». Вес 2 за FTS — «попал в оба» уже
-	// не перекрывает «первое место в точном поиске».
-	const (
-		rrfK      = 60.0
-		weightFTS = 2.0
-		weightVec = 1.0
-	)
+	const rrfK = 60.0
 	scores := map[int64]float64{}
 	bests := map[int64]Hit{}
 
 	add := func(hits []Hit, w float64) {
 		for i, h := range hits {
-			scores[h.ChunkID] += w / (rrfK + float64(i+1))
+			rank := i + 1
+			scores[h.ChunkID] += w / (rrfK + float64(rank))
 			if prev, ok := bests[h.ChunkID]; !ok || len(h.Text) > len(prev.Text) {
 				bests[h.ChunkID] = h
 			}
 		}
 	}
 	add(kw, weightFTS)
-	add(vec, weightVec)
+	add(vec, 1.0)
 
 	merged := make([]Hit, 0, len(bests))
 	for id, h := range bests {

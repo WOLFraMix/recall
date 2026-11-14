@@ -50,8 +50,6 @@ type Config struct {
 	ChunkOverlap int
 
 	// TopK — сколько ближайших чанков отдавать модели в контекст.
-	// 8: на вопросах «о целом» (кто главный герой, о чём книга) пяти
-	// фрагментов модели не хватает — больше материала, лучше ответы.
 	TopK int
 
 	// IngestWorkers — сколько документов обрабатываем параллельно.
@@ -79,7 +77,7 @@ func Load() (Config, error) {
 		ChatModel:     getEnv("RC_CHAT_MODEL", "qwen2.5-coder:7b"),
 		ChunkSize:     getInt("RC_CHUNK_SIZE", 800),
 		ChunkOverlap:  getInt("RC_CHUNK_OVERLAP", 100),
-		TopK:          getInt("RC_TOP_K", 8),
+		TopK:          getInt("RC_TOP_K", 10),
 		IngestWorkers: getInt("RC_INGEST_WORKERS", 4),
 		QueueSize:     getInt("RC_QUEUE_SIZE", 256),
 		HTTPTimeout:   getDuration("RC_HTTP_TIMEOUT", 5*time.Minute),

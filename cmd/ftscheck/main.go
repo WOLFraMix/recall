@@ -1,8 +1,9 @@
-// cmd/ftscheck — прямой осмотр FTS-канала: без KeywordSearch,
-// без RRF, без HTTP. Отвечает на три вопроса:
+// cmd/ftscheck — прямой осмотр FTS-канала.
+// Отвечает на четыре вопроса:
 //  1. есть ли вообще строки в FTS-индексе;
 //  2. находят ли их rowid'ы свои чанки (или база «старая»);
-//  3. что возвращает MATCH для слов пользователя.
+//  3. как продакшен-логика поняла запрос: план термов, их df и решения фильтров;
+//  4. что возвращает KeywordSearch с этой логикой.
 package main
 
 import (
@@ -18,7 +19,7 @@ import (
 
 func main() {
 	args := os.Args[1:]
-	if len(args) == 0 {
+	if len(args) < 2 {
 		fmt.Println("usage: go run ./cmd/ftscheck <db-путь> <слова запроса...>")
 		fmt.Println("пример: go run ./cmd/ftscheck ./data/recall.db на машине")
 		os.Exit(2)
@@ -59,12 +60,8 @@ func main() {
 	}
 	fmt.Println("→ FTS-индекс цел, rowid-связка работает.")
 
-	if words == "" {
-		return
-	}
-
-	// Демо выдачи — через продакшен-логику (стоп-слова, DF-фильтр,
-	// OR-сборка): инструмент показывает то же, что увидит чат.
+	// Дальше — через store.New: тот же пакет, что у приложения, поэтому
+	// план и выдача совпадают с продакшеном по определению, а не «похожи».
 	st, err := store.New(dbPath)
 	if err != nil {
 		fmt.Println("store:", err)
@@ -72,12 +69,30 @@ func main() {
 	}
 	defer st.Close()
 
+	// План запроса: какие термы построены, их df в корпусе и решения
+	// фильтров (стоп-слова, абсолютный и относительный DF-потолки).
+	// Это главная диагностика: она показывает, ЧТО канал понял из запроса.
+	plan, dfMin, err := st.PlanQuery(context.Background(), words)
+	if err != nil {
+		fmt.Println("план:", err)
+		return
+	}
+	fmt.Printf("\nплан запроса (специфичность: df редчайшего терма = %d):\n", dfMin)
+	for _, t := range plan {
+		status := "берём"
+		if !t.Kept {
+			status = "отсечён: " + t.Reason
+		}
+		fmt.Printf("  %-20s df=%-4d %s\n", t.Term, t.DF, status)
+	}
+
+	// Выдача — через продакшен-логику KeywordSearch.
 	hits, err := st.KeywordSearch(context.Background(), words, 10)
 	if err != nil {
 		fmt.Println("KeywordSearch:", err)
 		return
 	}
-	fmt.Println("\nвыдача KeywordSearch (продакшен-логика):")
+	fmt.Println("\nвыдача KeywordSearch:")
 	for i, h := range hits {
 		text := h.Text
 		if len(text) > 100 {
