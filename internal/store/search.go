@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -22,53 +23,145 @@ type Hit struct {
 // искать точное сочетание слов, а не россыпь терминов.
 var phraseRe = regexp.MustCompile(`"([^"]+)"`)
 
+// russianStop — служебные слова русского языка. В FTS они не должны
+// становиться термами: bm25 понижает их вес в СВОЕЙ шкале, но RRF видит
+// только позиции — а частотные слова дают им позиции, забивая канал
+// шумом. Урок бенчмарка: «что делает это приложение?» через OR выдало
+// 16 чанков книги по слову «что», и они вытеснили README с векторного
+// ранга 1. Стоп-слова режут шум до того, как он попал в fusion.
+var russianStop = map[string]struct{}{
+	"а": {}, "без": {}, "больше": {}, "будет": {}, "будто": {}, "бы": {},
+	"был": {}, "была": {}, "были": {}, "было": {}, "быть": {}, "в": {},
+	"вам": {}, "вас": {}, "вдруг": {}, "ведь": {}, "во": {}, "вот": {},
+	"все": {}, "всего": {}, "всех": {}, "вы": {}, "где": {}, "да": {},
+	"даже": {}, "для": {}, "до": {}, "его": {}, "ее": {}, "ей": {},
+	"её": {}, "если": {}, "есть": {}, "еще": {}, "ещё": {}, "же": {},
+	"за": {}, "здесь": {}, "и": {}, "из": {}, "или": {}, "им": {},
+	"их": {}, "к": {}, "как": {}, "когда": {}, "кто": {}, "куда": {},
+	"ли": {}, "лишь": {}, "либо": {}, "мне": {}, "может": {}, "мы": {},
+	"на": {}, "над": {}, "не": {}, "него": {}, "нее": {}, "неё": {},
+	"нет": {}, "ни": {}, "нибудь": {}, "но": {}, "о": {}, "об": {},
+	"однако": {}, "он": {}, "она": {}, "они": {}, "опять": {}, "от": {},
+	"по": {}, "под": {}, "пока": {}, "потом": {}, "потому": {}, "при": {},
+	"про": {}, "просто": {}, "пусть": {}, "раз": {}, "с": {}, "сам": {},
+	"свой": {}, "себе": {}, "себя": {}, "со": {}, "совсем": {}, "так": {},
+	"также": {}, "такой": {}, "там": {}, "тем": {}, "теперь": {}, "то": {},
+	"тогда": {}, "того": {}, "тоже": {}, "той": {}, "только": {}, "том": {},
+	"тот": {}, "тут": {}, "ты": {}, "у": {}, "уже": {}, "хоть": {},
+	"чего": {}, "чем": {}, "через": {}, "что": {}, "чтобы": {}, "эти": {},
+	"это": {}, "этот": {}, "я": {},
+}
+
+// IsStopword — проверка, является ли слово служебным (для инструментов,
+// которые должны повторять логику FTS-канала: ftscheck, подсветка).
+func IsStopword(w string) bool {
+	_, ok := russianStop[strings.ToLower(w)]
+	return ok
+}
+
+// KeywordSearch — полнотекстовый канал гибридного поиска.
+// Два фильтра шума, каждый — урок из бенчмарка:
+//  1. стоп-слова: служебные слова не становятся термами;
+//  2. адаптивный DF-фильтр: основа, встречающаяся более чем в 5%
+//     чанков корпуса, не несёт различительного смысла (в романе это
+//     «делае*», в техдокументации — то же слово сильный термин!
+//     Поэтому фильтр считаем по КАЖДОМУ корпусу, а не фиксируем
+//     списком). Без него частотные основы заполняли выдачу и
+//     вытесняли сильные векторные совпадения из fusion.
 func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, error) {
-	// 1) фразы в кавычках — как фразы (порядок слов важен);
-	// 2) оставшиеся слова — независимыми термами через OR.
-	//
-	// Почему OR, а не AND: вопрос пользователя — естественная фраза,
-	// а не поисковый запрос. AND требует, чтобы ВСЕ слова («как»,
-	// «зовут», «героиню») встретились в одном чанке — такое совпадение
-	// почти невозможно, канал молча выдавал пустоту. OR даёт полноту:
-	// чанки с редкими словами bm25 поднимет в топ сам, частые («на»)
-	// почти не влияют на оценку.
 	phrases := phraseRe.FindAllString(query, -1)
 	rest := phraseRe.ReplaceAllString(query, " ")
 
-	var terms []string
+	// Кандидаты: фразы (явный выбор пользователя — не фильтруем)
+	// и одиночные слова (стоп-слова отсекаем, длинные — в префикс).
+	type cand struct {
+		term  string
+		isPhr bool
+	}
+	var cands []cand
 	for _, p := range phrases {
 		p = strings.Join(strings.Fields(p), " ")
 		if p == "" {
 			continue
 		}
 		p = strings.ReplaceAll(p, `"`, `""`)
-		terms = append(terms, `"`+p+`"`)
+		cands = append(cands, cand{`"` + p + `"`, true})
 	}
 	for _, w := range strings.Fields(rest) {
 		w = strings.ToLower(strings.TrimFunc(w, func(r rune) bool {
 			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 		}))
+		if w == "" {
+			continue
+		}
+		if _, stop := russianStop[w]; stop {
+			continue
+		}
 		r := []rune(w)
 		if len(r) == 0 {
 			continue
 		}
 		if len(r) > 4 {
-			// Псевдо-стемминг: unicode61 не знает русской морфологии,
-			// «машине» и «машин» для него разные слова. Префикс *
-			// покрывает формы ценой лёгкого шума.
-			terms = append(terms, string(r[:len(r)-1])+"*")
+			cands = append(cands, cand{string(r[:len(r)-1]) + "*", false})
 		} else {
-			terms = append(terms, `"`+w+`"`)
+			cands = append(cands, cand{`"` + strings.ReplaceAll(w, `"`, `""`) + `"`, false})
 		}
 	}
-	if len(terms) == 0 {
+	if len(cands) == 0 {
 		return nil, nil
 	}
-	match := strings.Join(terms, " OR ")
 
-	// ВАЖНО: contentless-таблица НЕ хранит UNINDEXED-колонки — f.chunk_id
-	// всегда NULL, и JOIN по нему давал ноль строк. Зато хранится rowid:
-	// пишем в FTS с rowid = chunks.id и джойнимся по f.rowid.
+	// DF-фильтр: порог = max(5, 5% от числа чанков). Считать count на
+	// базу из тысячи чанков — микросекунды, кэшировать незачем.
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&total); err != nil {
+		return nil, err
+	}
+	dfLimit := total * 5 / 100
+	if dfLimit < 5 {
+		dfLimit = 5
+	}
+
+	var kept []string
+	type droppedTerm struct {
+		term string
+		df   int
+	}
+	var dropped []droppedTerm
+	for _, c := range cands {
+		if c.isPhr {
+			kept = append(kept, c.term)
+			continue
+		}
+		var df int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?`, c.term,
+		).Scan(&df); err != nil {
+			continue // битый терм не роняет канал — просто пропускаем
+		}
+		if df <= dfLimit {
+			kept = append(kept, c.term)
+		} else {
+			dropped = append(dropped, droppedTerm{c.term, df})
+		}
+	}
+
+	// Все термы частотные (вопрос целиком из частотных слов) — берём
+	// два самых редких: пусть канал молчит осмысленно, а не нулём.
+	if len(kept) == 0 && len(dropped) > 0 {
+		sort.Slice(dropped, func(i, j int) bool { return dropped[i].df < dropped[j].df })
+		for i, d := range dropped {
+			if i == 2 {
+				break
+			}
+			kept = append(kept, d.term)
+		}
+	}
+	if len(kept) == 0 {
+		return nil, nil
+	}
+	match := strings.Join(kept, " OR ")
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT c.id, c.doc_id, d.name, c.seq, c.text, bm25(chunks_fts) AS score
 		FROM chunks_fts f

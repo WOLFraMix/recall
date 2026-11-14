@@ -6,31 +6,15 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"strings"
 
+	"github.com/WOLFraMix/recall/internal/store"
 	_ "modernc.org/sqlite"
 )
-
-// buildMatch повторяет логику KeywordSearch: слово длиннее 4 букв
-// становится префиксом (машине → машин*), короче — точной формой.
-func buildMatch(query string) string {
-	var terms []string
-	for _, w := range strings.Fields(query) {
-		r := []rune(strings.ToLower(w))
-		if len(r) == 0 {
-			continue
-		}
-		if len(r) > 4 {
-			terms = append(terms, string(r[:len(r)-1])+"*")
-		} else {
-			terms = append(terms, `"`+strings.ReplaceAll(w, `"`, `""`)+`"`)
-		}
-	}
-	return strings.Join(terms, " OR ")
-}
 
 func main() {
 	args := os.Args[1:]
@@ -79,37 +63,29 @@ func main() {
 		return
 	}
 
-	match := buildMatch(words)
-	fmt.Println("\nMATCH-запрос:", match)
-	rows, err := db.Query(`
-		SELECT c.id, d.name, c.seq, c.text
-		FROM chunks_fts f
-		JOIN chunks c ON c.id = f.rowid
-		JOIN documents d ON d.id = c.doc_id
-		WHERE chunks_fts MATCH ?
-		ORDER BY bm25(chunks_fts) ASC
-		LIMIT 10`, match)
+	// Демо выдачи — через продакшен-логику (стоп-слова, DF-фильтр,
+	// OR-сборка): инструмент показывает то же, что увидит чат.
+	st, err := store.New(dbPath)
 	if err != nil {
-		fmt.Println("MATCH:", err)
+		fmt.Println("store:", err)
 		return
 	}
-	defer rows.Close()
+	defer st.Close()
 
-	i := 0
-	for rows.Next() {
-		var id, seq int64
-		var name, text string
-		if err := rows.Scan(&id, &name, &seq, &text); err != nil {
-			fmt.Println("scan:", err)
-			return
-		}
-		i++
+	hits, err := st.KeywordSearch(context.Background(), words, 10)
+	if err != nil {
+		fmt.Println("KeywordSearch:", err)
+		return
+	}
+	fmt.Println("\nвыдача KeywordSearch (продакшен-логика):")
+	for i, h := range hits {
+		text := h.Text
 		if len(text) > 100 {
 			text = text[:100] + "…"
 		}
-		fmt.Printf("%2d. %s · фрагм. %d — %s\n", i, name, seq+1, text)
+		fmt.Printf("%2d. %s · фрагм. %d — %s\n", i+1, h.DocName, h.Seq+1, text)
 	}
-	if i == 0 {
-		fmt.Println("MATCH не вернул ни одной строки — канал мёртв даже при живом индексе")
+	if len(hits) == 0 {
+		fmt.Println("пусто — все термы отсечены фильтрами или не нашлись")
 	}
 }
