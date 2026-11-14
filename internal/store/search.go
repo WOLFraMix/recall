@@ -51,17 +51,26 @@ func IsStopword(w string) bool {
 //	dfAbsPct — абсолютный потолок: терм в >5% чанков корпуса не
 //	           различает документы;
 //	dfRelFactor — относительный потолок: терм в >10 раз частотнее
-//	           самого редкого терма запроса — шум на фоне якоря.
-//	           Порог именно ОТНОСИТЕЛЬНЫЙ: фиксированные проценты либо
-//	           пропускают «делае*» (df~40 < 5% от 1115), либо режут
-//	           «машин*» в маленькой базе. Якорь запроса — честный
-//	           масштаб для каждого конкретного вопроса.
+//	           самого редкого терма запроса — шум на фоне якоря;
 //	dfMinKeep — нижняя граница порогов: запрос с одним сверхредким
 //	           словом не должен выкашивать всех соседей.
 const (
 	dfAbsPct    = 5
 	dfRelFactor = 10
 	dfMinKeep   = 5
+)
+
+// Параметры переранжирования — второй этап fusion:
+//
+//	covBonus — за каждую покрытую основу запроса в тексте чанка;
+//	phraseBonus — за точную фразу из кавычек.
+//
+// RRF видит только ПОЗИЦИИ каналов и не знает, чем именно чанк совпал:
+// «машинально» и «машине» дают одинаковые позиции. Покрытие различает
+// чанк, отвечающий на весь запрос, от чанка с одним случайным словом.
+const (
+	covBonus    = 0.03
+	phraseBonus = 0.05
 )
 
 // Hit — результат поиска: чанк, его документ и оценка канала.
@@ -84,16 +93,30 @@ type TermDF struct {
 	Reason string
 }
 
+// termInfo — терм в машинной форме: для переранжирования нужен не
+// MATCH-синтаксис, а основа, которую можно искать подстрокой в тексте.
+type termInfo struct {
+	stem     string // основа без * и кавычек
+	isPhrase bool
+}
+
+// normalize — общая нормализация сравнения текста: нижний регистр, ё → е.
+func normalize(s string) string {
+	return strings.ReplaceAll(strings.ToLower(s), "ё", "е")
+}
+
 // planAll — единая точка построения FTS-запроса: фразы, стоп-слова,
 // псевдо-стемминг, DF-фильтр. KeywordSearch и HybridSearch зовут её,
 // поэтому логика не может разъехаться между каналами.
-// Возвращает готовое MATCH-выражение, df самого редкого терм
-// (специфичность запроса — для адаптивного веса канала) и план.
-func (s *Store) planAll(ctx context.Context, query string) (string, int, []TermDF, error) {
+// Возвращает готовое MATCH-выражение, df самого редкого терма
+// (специфичность — для адаптивного веса канала), машинные термы
+// (для переранжирования) и человекочитаемый план (для ftscheck).
+func (s *Store) planAll(ctx context.Context, query string) (string, int, []termInfo, []TermDF, error) {
 	phrases := phraseRe.FindAllString(query, -1)
 	rest := phraseRe.ReplaceAllString(query, " ")
 
 	var kept []string
+	var keptTerms []termInfo
 	var plan []TermDF
 
 	// Фразы — явный выбор пользователя: не фильтруем ни чем.
@@ -105,6 +128,7 @@ func (s *Store) planAll(ctx context.Context, query string) (string, int, []TermD
 		p = strings.ReplaceAll(p, `"`, `""`)
 		term := `"` + p + `"`
 		kept = append(kept, term)
+		keptTerms = append(keptTerms, termInfo{stem: normalize(p), isPhrase: true})
 		plan = append(plan, TermDF{Term: term, Kept: true, Reason: "фраза — не фильтруем"})
 	}
 
@@ -129,21 +153,25 @@ func (s *Store) planAll(ctx context.Context, query string) (string, int, []TermD
 			// Псевдо-стемминг: unicode61 не знает русской морфологии,
 			// «машина» и «машине» для него разные слова. Префикс *
 			// покрывает формы ценой лёгкого шума.
-			words = append(words, string(r[:len(r)-1])+"*")
+			stem := string(r[:len(r)-1])
+			words = append(words, stem+"*")
+			keptTerms = append(keptTerms, termInfo{stem: normalize(stem)})
 		} else {
-			words = append(words, `"`+strings.ReplaceAll(w, `"`, `""`)+`"`)
+			q := `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+			words = append(words, q)
+			keptTerms = append(keptTerms, termInfo{stem: normalize(w)})
 		}
 	}
 	if len(words) == 0 {
 		if len(kept) == 0 {
-			return "", 0, plan, nil
+			return "", 0, keptTerms, plan, nil
 		}
-		return strings.Join(kept, " OR "), 0, plan, nil
+		return strings.Join(kept, " OR "), 0, keptTerms, plan, nil
 	}
 
 	var total int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&total); err != nil {
-		return "", 0, plan, err
+		return "", 0, keptTerms, plan, err
 	}
 	absLimit := total * dfAbsPct / 100
 	if absLimit < dfMinKeep {
@@ -191,6 +219,10 @@ func (s *Store) planAll(ctx context.Context, query string) (string, int, []TermD
 				fmt.Sprintf("шумный: %d > %d (%d× редчайшего)", d.df, relLimit, dfRelFactor)})
 		default:
 			kept = append(kept, d.term)
+			// В keptTerms попадают только живые термы — переранжирование
+			// считает покрытие по ним, а не по отсечённому шуму.
+			stem := strings.Trim(d.term, `*"`)
+			keptTerms = append(keptTerms, termInfo{stem: normalize(stem)})
 			plan = append(plan, TermDF{d.term, d.df, true, ""})
 		}
 	}
@@ -207,20 +239,22 @@ func (s *Store) planAll(ctx context.Context, query string) (string, int, []TermD
 				continue
 			}
 			kept = append(kept, d.term)
+			stem := strings.Trim(d.term, `*"`)
+			keptTerms = append(keptTerms, termInfo{stem: normalize(stem)})
 		}
 	}
 	if len(kept) == 0 {
-		return "", 0, plan, nil
+		return "", 0, keptTerms, plan, nil
 	}
 	if dfMin < 0 {
 		dfMin = 0
 	}
-	return strings.Join(kept, " OR "), dfMin, plan, nil
+	return strings.Join(kept, " OR "), dfMin, keptTerms, plan, nil
 }
 
 // PlanQuery — разбор запроса для диагностики (ftscheck).
 func (s *Store) PlanQuery(ctx context.Context, query string) ([]TermDF, int, error) {
-	_, dfMin, plan, err := s.planAll(ctx, query)
+	_, dfMin, _, plan, err := s.planAll(ctx, query)
 	return plan, dfMin, err
 }
 
@@ -252,7 +286,7 @@ func (s *Store) searchFTS(ctx context.Context, match string, k int) ([]Hit, erro
 
 // KeywordSearch — полнотекстовый канал: план запроса + исполнение.
 func (s *Store) KeywordSearch(ctx context.Context, query string, k int) ([]Hit, error) {
-	match, _, _, err := s.planAll(ctx, query)
+	match, _, _, _, err := s.planAll(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -294,18 +328,18 @@ func (s *Store) VectorSearch(ctx context.Context, queryVec []float32, k int) ([]
 	return all, nil
 }
 
-// HybridSearch — слияние каналов через RRF с АДАПТИВНЫМ весом FTS.
-// Урок bench: статический вес 2 превращал частотные слова в топ fusion
-// («что делает...» — толпа чанков с «делае*» била README с векторного
-// ранга 1). Вес канала = функция специфичности запроса (df редчайшего
-// терма): редкий якорь → точный сигнал → вес 2; только частотные слова
-// → FTS-сигнал слабый → вес 0.5, топ вектора спасён.
+// HybridSearch — fusion + переранжирование.
+// Этап 1 (RRF с адаптивным весом FTS) собирает кандидат: кто в каком
+// канале на какой позиции. Этап 2 (rerank) пересортировывает по
+// признакам, которых у RRF нет: покрытие основ запроса и точные фразы.
 func (s *Store) HybridSearch(ctx context.Context, queryVec []float32, query string, k int) ([]Hit, error) {
-	match, dfMin, _, err := s.planAll(ctx, query)
+	match, dfMin, keptTerms, _, err := s.planAll(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 
+	// Адаптивный вес FTS: редкий якорь → точный сигнал → вес 2;
+	// только частотные слова → слабый сигнал → 0.5.
 	weightFTS := 2.0
 	switch {
 	case dfMin > 30:
@@ -314,14 +348,17 @@ func (s *Store) HybridSearch(ctx context.Context, queryVec []float32, query stri
 		weightFTS = 1.0
 	}
 
+	// Кандидатов берём шире итога (k*3): переранжирование осмысленно
+	// только когда есть из чего выбирать — правильный чанк может
+	// стоять на 30-м месте канала и всё равно подняться на этап 2.
 	var kw []Hit
 	if match != "" {
-		kw, err = s.searchFTS(ctx, match, k*2)
+		kw, err = s.searchFTS(ctx, match, k*3)
 		if err != nil {
 			return nil, err
 		}
 	}
-	vec, err := s.VectorSearch(ctx, queryVec, k*2)
+	vec, err := s.VectorSearch(ctx, queryVec, k*3)
 	if err != nil {
 		return nil, err
 	}
@@ -341,6 +378,30 @@ func (s *Store) HybridSearch(ctx context.Context, queryVec []float32, query stri
 	}
 	add(kw, weightFTS)
 	add(vec, 1.0)
+
+	// Этап 2: переранжирование. RRF не отличает «чанк отвечает на весь
+	// запрос» от «чанк поймал одно случайное слово» — покрытие основ
+	// различает. Фраза в кавычках — самый сильный пользовательский
+	// сигнал, ей отдельный бонус.
+	if len(keptTerms) > 0 {
+		for id, h := range bests {
+			txt := normalize(h.Text)
+			matched := 0
+			phraseHit := false
+			for _, t := range keptTerms {
+				if strings.Contains(txt, t.stem) {
+					matched++
+					if t.isPhrase {
+						phraseHit = true
+					}
+				}
+			}
+			scores[id] += covBonus * float64(matched)
+			if phraseHit {
+				scores[id] += phraseBonus
+			}
+		}
+	}
 
 	merged := make([]Hit, 0, len(bests))
 	for id, h := range bests {
