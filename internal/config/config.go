@@ -60,6 +60,9 @@ type Config struct {
 
 	// HTTPTimeout — таймаут запросов к LLM (генерация бывает долгой).
 	HTTPTimeout time.Duration
+
+	// SummaryModel — модель для выжимки. Пустая строка = берём ChatModel.
+	SummaryModel string
 }
 
 // Load собирает конфигурацию. Сначала загружает .env в окружение,
@@ -74,13 +77,14 @@ func Load() (Config, error) {
 		DBPath:        getEnv("RC_DB_PATH", "./data/recall.db"),
 		LLMURL:        getEnv("RC_LLM_URL", "http://localhost:11434"),
 		EmbedModel:    getEnv("RC_EMBED_MODEL", "bge-m3"),
-		ChatModel:     getEnv("RC_CHAT_MODEL", "qwen2.5-coder:7b"),
+		ChatModel:     getEnv("RC_CHAT_MODEL", "qwen2.5:7b"),
 		ChunkSize:     getInt("RC_CHUNK_SIZE", 800),
 		ChunkOverlap:  getInt("RC_CHUNK_OVERLAP", 100),
 		TopK:          getInt("RC_TOP_K", 10),
 		IngestWorkers: getInt("RC_INGEST_WORKERS", 4),
 		QueueSize:     getInt("RC_QUEUE_SIZE", 256),
 		HTTPTimeout:   getDuration("RC_HTTP_TIMEOUT", 5*time.Minute),
+		SummaryModel:  getEnv("RC_SUMMARY_MODEL", "qwen2.5:7b"),
 	}, nil
 }
 

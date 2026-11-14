@@ -21,7 +21,7 @@ Recall — классический RAG (Retrieval-Augmented Generation) на л
    комбинирует семантическую близость (косинусное сходство) и полнотекстовый
    поиск (bm25) через Reciprocal Rank Fusion.
 4. **Generation**: найденные фрагменты собираются в промпт, и локальная
-   chat-модель (`qwen2.5-coder:7b` через Ollama) отвечает строго по ним —
+   chat-модель (`qwen2.5:7b` через Ollama) отвечает строго по ним —
    с цитатами [N]. Ответ стримится в браузер по SSE токен за токеном.
 
 Против галлюцинаций работает grounding: модель обязана отвечать только
@@ -56,7 +56,7 @@ Recall — классический RAG (Retrieval-Augmented Generation) на л
 ## Установка
 
 > Нужен [Ollama](https://ollama.com) с двумя моделями:
-> `ollama pull nomic-embed-text && ollama pull qwen2.5-coder:7b`
+> `ollama pull nomic-embed-text && ollama pull qwen2.5:7b`
 (первая для обработки текста, вторую можете использовать подходящую под ваше железо)
 
 ### Вариант 1 — готовый бинарник

@@ -19,6 +19,7 @@ import (
 	"github.com/WOLFraMix/recall/internal/ingest"
 	"github.com/WOLFraMix/recall/internal/llm"
 	"github.com/WOLFraMix/recall/internal/store"
+	"github.com/WOLFraMix/recall/internal/summarize"
 	"github.com/WOLFraMix/recall/web"
 	"github.com/gin-gonic/gin"
 )
@@ -34,6 +35,7 @@ type API struct {
 	st  *store.Store
 	ing *ingest.Ingester
 	llm llm.Provider
+	sum *summarize.Service
 }
 
 // New собирает роутер и возвращает *http.Server (а не gin-роутер!):
@@ -41,7 +43,16 @@ type API struct {
 // для graceful shutdown.
 func New(cfg config.Config, st *store.Store, ing *ingest.Ingester, provider llm.Provider) *http.Server {
 	gin.SetMode(gin.ReleaseMode)
-	a := &API{cfg: cfg, st: st, ing: ing, llm: provider}
+	a := &API{
+		cfg: cfg,
+		st:  st,
+		ing: ing,
+		llm: provider,
+		// Сервис выжимки собирается здесь: у него своя модель
+		// (RC_SUMMARY_MODEL, по умолчанию — чат-модель) и своя папка
+		// для .md-файлов. Чату и выжимке не нужно знать друг о друге.
+		sum: summarize.New(cfg.LLMURL, summaryModel(cfg), filepath.Join("data", "summaries"), st),
+	}
 
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
@@ -57,6 +68,11 @@ func New(cfg config.Config, st *store.Store, ing *ingest.Ingester, provider llm.
 	r.POST("/api/chat", a.chat)
 	r.GET("/api/stats", a.stats)
 
+	// Выжимка: запуск фоновой задачи, polling статуса, скачивание .md.
+	r.POST("/api/summarize", a.handleSummarizeStart)
+	r.GET("/api/summary/:id", a.handleSummaryGet)
+	r.GET("/api/summary/:id/download", a.handleSummaryDownload)
+
 	// Всё, что не попало в /api/* — встроенная статика из embed.FS.
 	r.NoRoute(func(c *gin.Context) {
 		http.FileServer(http.FS(web.Files)).ServeHTTP(c.Writer, c.Request)
@@ -69,6 +85,15 @@ func New(cfg config.Config, st *store.Store, ing *ingest.Ingester, provider llm.
 		// приславший заголовки по кусочкам, не удержит соединение вечно.
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+}
+
+// summaryModel — модель выжимки: RC_SUMMARY_MODEL, а если не задана —
+// чат-модель. Один источник правды о фоллбеке, не дублируем в UI.
+func summaryModel(cfg config.Config) string {
+	if cfg.SummaryModel != "" {
+		return cfg.SummaryModel
+	}
+	return cfg.ChatModel
 }
 
 // --- Загрузка документов ---
@@ -298,6 +323,62 @@ func buildPrompt(question string, hits []store.Hit) []llm.Message {
 				"\nВопрос: " + question,
 		},
 	}
+}
+
+// --- Выжимка ---
+//
+// Три эндпоинта вокруг фоновой задачи: запуск (202 Accepted — работа
+// принята, но не завершена), polling статуса и скачивание результата.
+// HTTP-запрос НЕ ждёт генерацию: она идёт десятки минут.
+
+func (a *API) handleSummarizeStart(c *gin.Context) {
+	var req struct {
+		DocID int64 `json:"doc_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.DocID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "нужен doc_id"})
+		return
+	}
+	if !a.sum.Start(req.DocID) {
+		// 409 Conflict: задача уже идёт — второй запуск не нужен,
+		// фронтенд просто продолжит polling.
+		c.JSON(http.StatusConflict, gin.H{"error": "выжимка уже выполняется"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"status": "running"})
+}
+
+func (a *API) handleSummaryGet(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "плохой id"})
+		return
+	}
+	status, text, err := a.st.GetSummary(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// status: none | running | ready | error — фронтенд рисует по нему.
+	c.JSON(http.StatusOK, gin.H{"status": status, "text": text})
+}
+
+// Файл скачивается из текста в базе — не читаем диск: единый источник
+// истины, и в ответе не может не оказаться того, что видел пользователь.
+func (a *API) handleSummaryDownload(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "плохой id"})
+		return
+	}
+	status, text, err := a.st.GetSummary(c.Request.Context(), id)
+	if err != nil || status != "ready" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "готовой выжимки нет"})
+		return
+	}
+	c.Header("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="summary_%d.txt"`, id))
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(text))
 }
 
 // --- Статистика ---

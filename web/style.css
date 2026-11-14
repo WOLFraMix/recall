@@ -325,3 +325,67 @@ button:hover {
     border-radius: 3px;
     padding: 0 2px;
 }
+
+/* --- Выжимка --- */
+
+.sumwrap {
+    flex: 1;
+    overflow-y: auto;
+    max-width: 760px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 24px 16px;
+}
+
+.sumbar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.sumbar select {
+    flex: 1;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--fg);
+    font: inherit;
+}
+
+.sum-status {
+    color: var(--dim);
+    font-size: 13px;
+    min-height: 20px;
+    margin-bottom: 12px;
+}
+
+.sum-status.error {
+    color: var(--err);
+}
+
+.sum-text {
+    white-space: pre-wrap;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+    color: #c7cdd8;
+    font-size: 14px;
+}
+
+.sum-text:empty {
+    display: none;
+}
+
+#sum-dl {
+    display: inline-block;
+    margin-top: 12px;
+    color: var(--acc);
+    text-decoration: none;
+    font-size: 14px;
+}
+
+#sum-dl:hover {
+    text-decoration: underline;
+}

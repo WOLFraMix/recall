@@ -67,7 +67,7 @@ func search(ctx context.Context, st *store.Store, prov llm.Provider, mode, q str
 func main() {
 	casesPath := flag.String("cases", "testdata/bench.json", "JSON с контрольными вопросами")
 	mode := flag.String("mode", "hybrid", "режим поиска: hybrid | fts | vector")
-	k := flag.Int("k", 15, "глубина оценки (Hit@k)")
+	k := flag.Int("k", 20, "глубина оценки (Hit@k)")
 	flag.Parse()
 
 	cfg, err := config.Load()

@@ -1,4 +1,4 @@
-// Recall UI: загрузка документов, чат со стримингом (SSE из fetch), поиск.
+// Recall UI: загрузка документов, чат со стримингом (SSE из fetch), поиск, выжимка.
 // Правила надёжности:
 //  1) состояние занятости — отдельный флаг busy, восстанавливается в finally;
 //  2) один битый кадр потока не убивает обработку остальных (try/catch в цикле);
@@ -25,12 +25,19 @@ function esc(s) {
 }
 
 // --- Вкладки ---
-
+//
+// Универсальный переключатель: работает для любой вкладки, добавленной
+// в index.html с data-tab и парной панелью <main id="view-имя">.
+// Новая вкладка больше не требует правок в JS — только HTML.
 const tabs = document.querySelectorAll(".tab");
 tabs.forEach((t) => t.addEventListener("click", () => {
     tabs.forEach((x) => x.classList.toggle("active", x === t));
-    document.getElementById("view-chat").hidden = t.dataset.tab !== "chat";
-    document.getElementById("view-search").hidden = t.dataset.tab !== "search";
+    document.querySelectorAll("main[id^='view-']").forEach((v) => {
+        v.hidden = v.id !== "view-" + t.dataset.tab;
+    });
+    // Список документов выжимки обновляем при входе на вкладку:
+    // пользователь мог залить файл с прошлой вкладки.
+    if (t.dataset.tab === "summarize") refreshSumDocs();
 }));
 
 // --- Загрузка файлов ---
@@ -297,3 +304,141 @@ function highlightTerms(el, text, query) {
 
 $("#sbtn").addEventListener("click", doSearch);
 $("#sq").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+
+// --- Выжимка ---
+//
+// Принцип после бага с «Готово» на пустом статусе: фронтенд НИКОГДА
+// не догадывается о состоянии задачи — он читает его из базы. Единственная
+// точка синхронизации — applySummaryState; её зовут при входе на вкладку,
+// смене документа, после 409 и по таймеру поллинга.
+
+const sumRun = $("#sum-run");
+const sumStatus = $("#sum-status");
+let sumPolling = null; // id документа, который мы сейчас поллим
+
+async function refreshSumDocs() {
+    try {
+        const r = await fetch("/api/documents");
+        if (!r.ok) return;
+        const list = await r.json();
+        const sel = $("#sum-doc");
+        const prev = sel.value;
+        sel.replaceChildren();
+        for (const d of Array.isArray(list) ? list : []) {
+            if (d.status !== "ready") continue; // выжимать можно только готовые
+            const opt = document.createElement("option");
+            opt.value = d.id;
+            opt.textContent = d.name;
+            sel.appendChild(opt);
+        }
+        if (prev) sel.value = prev; // выбранный документ не сбрасываем
+        if (!sumPolling) {
+            sumRun.disabled = false;
+            const id = +sel.value;
+            if (id) await applySummaryState(id);
+        }
+    } catch (e) {
+        // поллинг живёт своей жизнью
+    }
+}
+
+// applySummaryState — рисует UI строго по фактическому статусу в базе.
+async function applySummaryState(id) {
+    let s;
+    try {
+        s = await (await fetch(`/api/summary/${id}`)).json();
+    } catch (e) {
+        return; // сетевая осечка — повторится на следующем тике
+    }
+    sumStatus.classList.remove("error");
+    switch (s.status) {
+        case "running":
+            sumStatus.textContent = "Генерирую…";
+            sumRun.disabled = true;
+            sumPolling = id;
+            pollSummary(id);
+            break;
+        case "ready":
+            sumStatus.textContent = "Готово";
+            $("#sum-result").textContent = s.text;
+            const dl = $("#sum-dl");
+            dl.href = `/api/summary/${id}/download`;
+            dl.hidden = false;
+            sumRun.disabled = false;
+            break;
+        case "error":
+            sumStatus.textContent = "Ошибка: " + (s.error || "неизвестная");
+            sumStatus.classList.add("error");
+            sumRun.disabled = false;
+            break;
+        default: // none — выжимку ещё не запускали: чистое состояние
+            sumStatus.textContent = "";
+            $("#sum-result").textContent = "";
+            $("#sum-dl").hidden = true;
+            sumRun.disabled = false;
+    }
+}
+
+sumRun.addEventListener("click", async () => {
+    const id = +$("#sum-doc").value;
+    if (!id) return;
+    sumRun.disabled = true;
+    try {
+        const r = await fetch("/api/summarize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ doc_id: id }),
+        });
+        if (r.status === 409) {
+            // Задача уже идёт — не рисуем тупиковую надпись, а подключаемся
+            // к её реальному статусу: пользователь увидит «Генерирую…»
+            // или готовый результат.
+            await applySummaryState(id);
+            return;
+        }
+        if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            sumStatus.textContent = "Не удалось запустить" + (j.error ? ": " + j.error : "");
+            sumStatus.classList.add("error");
+            sumRun.disabled = false;
+            return;
+        }
+        sumStatus.classList.remove("error");
+        sumStatus.textContent = "Генерирую… (это может занять десятки минут)";
+        sumPolling = id;
+        pollSummary(id);
+    } catch (e) {
+        sumStatus.textContent = "⚠️ " + e.message;
+        sumStatus.classList.add("error");
+        sumRun.disabled = false;
+    }
+});
+
+function pollSummary(id) {
+    if (sumPolling === id) return; // уже поллим — второй таймер не нужен
+    const timer = setInterval(async () => {
+        let s;
+        try {
+            s = await (await fetch(`/api/summary/${id}`)).json();
+        } catch (e) {
+            return; // сетевая осечка — попробуем на следующем тике
+        }
+        if (s.status === "running") return; // ждём дальше
+        if (s.status === "none") return;    // статус ещё не появился — тоже ждём
+        clearInterval(timer);
+        sumPolling = null;
+        sumRun.disabled = false;
+        applySummaryState(id); // рисуем готовый результат/ошибку через общую точку
+    }, 3000);
+}
+
+// Смена документа в селекте — тоже синхронизация с реальным статусом:
+// у README может быть ready, у книги — none, у третьего — running.
+$("#sum-doc").addEventListener("change", () => {
+    if (!sumPolling) {
+        const id = +$("#sum-doc").value;
+        if (id) applySummaryState(id);
+    }
+});
+
+refreshSumDocs();

@@ -122,6 +122,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS summaries (
+	doc_id     INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+	status     TEXT NOT NULL DEFAULT 'none',
+	text       TEXT NOT NULL DEFAULT '',
+	error      TEXT NOT NULL DEFAULT '',
+	updated_at INTEGER NOT NULL DEFAULT 0
 );`
 	_, err := s.db.Exec(schema)
 	return err

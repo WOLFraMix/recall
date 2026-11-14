@@ -15,6 +15,7 @@
         <nav class="tabs">
             <button class="tab active" data-tab="chat">Чат</button>
             <button class="tab" data-tab="search">Поиск</button>
+            <button class="tab" data-tab="summarize">Выжимка</button>
         </nav>
     </header>
 
@@ -47,6 +48,19 @@
                 <button id="sbtn">Найти</button>
             </div>
             <div id="results"></div>
+        </section>
+    </main>
+
+    <!-- Вкладка «Выжимка»: map-reduce конспект документа с экспортом в .md -->
+    <main id="view-summarize" hidden>
+        <section class="sumwrap">
+            <div class="sumbar">
+                <select id="sum-doc" aria-label="Документ для выжимки"></select>
+                <button id="sum-run">Сделать выжимку</button>
+            </div>
+            <div id="sum-status" class="sum-status"></div>
+            <div id="sum-result" class="sum-text"></div>
+            <a id="sum-dl" href="#" download hidden>Скачать .txt</a>
         </section>
     </main>
 

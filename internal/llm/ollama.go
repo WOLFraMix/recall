@@ -15,7 +15,7 @@ import (
 type Ollama struct {
 	base       string       // например http://localhost:11434
 	embedModel string       // модель для векторов (nomic-embed-text:latest)
-	chatModel  string       // модель для ответов (qwen2.5-coder:7b)
+	chatModel  string       // модель для ответов (qwen2.5:7b)
 	hc         *http.Client // долгий таймаут: генерация 7B-модели может занять минуты
 }
 
